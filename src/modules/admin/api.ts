@@ -832,3 +832,118 @@ export async function fetchSentOrdersCount(): Promise<number> {
   if (error) throw new Error(error.message)
   return count ?? 0
 }
+
+// ---- Reports (read-only) ----
+
+export interface ReportMoveRow {
+  id: number
+  item_id: number
+  item_name: string
+  base_unit: BaseUnit
+  pack_size: number
+  pack_label: string
+  qty: number
+  unit_cost: number | null
+  source_type: string
+  source_id: string | null
+  apartment_id: number | null
+  staff_id: number | null
+  note: string | null
+  moved_at: string
+  from_loc: number
+  to_loc: number
+  from_location?: { name: string; type: string } | null
+  to_location?: { name: string; type: string } | null
+  author?: string | null
+  apartment_code?: string | null
+}
+
+async function fetchAllMovesPaginated(
+  filters: Record<string, unknown>,
+): Promise<ReportMoveRow[]> {
+  const allRows: ReportMoveRow[] = []
+  let offset = 0
+  const pageSize = 1000
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    let query = supabase
+      .from('stock_moves')
+      .select('id,item_id,from_loc,to_loc,qty,unit_cost,source_type,source_id,apartment_id,staff_id,note,moved_at,created_by')
+      .order('moved_at', { ascending: false })
+      .range(offset, offset + pageSize - 1)
+    for (const [key, value] of Object.entries(filters)) {
+      if (value === null || value === undefined || value === '') continue
+      if (key === 'moved_at_gte') query = query.gte('moved_at', value as string)
+      else if (key === 'moved_at_lt') query = query.lt('moved_at', value as string)
+      else query = query.eq(key, value as string)
+    }
+    const { data, error } = await query
+    if (error) throw new Error(error.message)
+    const rows = (data ?? []) as Array<ReportMoveRow & { created_by: string | null }>
+    if (rows.length === 0) break
+    allRows.push(...rows)
+    if (rows.length < pageSize) break
+    offset += pageSize
+  }
+  // Enrich with item, location, apartment, profile data
+  const itemIds = Array.from(new Set(allRows.map((r) => r.item_id)))
+  const locationIds = Array.from(new Set(allRows.flatMap((r) => [r.from_loc, r.to_loc])))
+  const aptIds = Array.from(new Set(allRows.map((r) => r.apartment_id).filter((id): id is number => id !== null)))
+  const authorIds = Array.from(new Set(allRows.map((r) => (r as ReportMoveRow & { created_by: string | null }).created_by).filter((id): id is string => id !== null)))
+  const [itemsRes, locsRes, aptsRes, profilesRes] = await Promise.all([
+    itemIds.length ? supabase.from('items').select('id,name,base_unit,pack_size,pack_label').in('id', itemIds) : Promise.resolve({ data: [], error: null as null | { message: string } }),
+    locationIds.length ? supabase.from('locations').select('id,name,type').in('id', locationIds) : Promise.resolve({ data: [], error: null as null | { message: string } }),
+    aptIds.length ? supabase.from('apartments').select('id,code').in('id', aptIds) : Promise.resolve({ data: [], error: null as null | { message: string } }),
+    authorIds.length ? supabase.from('profiles').select('id,full_name,login').in('id', authorIds) : Promise.resolve({ data: [], error: null as null | { message: string } }),
+  ])
+  if (itemsRes.error) throw new Error(itemsRes.error.message)
+  if (locsRes.error) throw new Error(locsRes.error.message)
+  if (aptsRes.error) throw new Error(aptsRes.error.message)
+  if (profilesRes.error) throw new Error(profilesRes.error.message)
+  const itemMap = new Map((itemsRes.data ?? []).map((i) => [i.id, i]))
+  const locMap = new Map((locsRes.data ?? []).map((l) => [l.id, l]))
+  const aptMap = new Map((aptsRes.data ?? []).map((a: { id: number; code: string }) => [a.id, a.code]))
+  const profileMap = new Map((profilesRes.data ?? []).map((p) => [p.id, p.full_name || p.login]))
+  return allRows.map((r) => {
+    const item = itemMap.get(r.item_id)
+    const { created_by, ...rest } = r as ReportMoveRow & { created_by: string | null }
+    return {
+      ...rest,
+      item_name: item?.name ?? '?',
+      base_unit: (item?.base_unit ?? 'pcs') as BaseUnit,
+      pack_size: item?.pack_size ?? 1,
+      pack_label: item?.pack_label ?? '',
+      from_location: locMap.get(r.from_loc) ?? null,
+      to_location: locMap.get(r.to_loc) ?? null,
+      author: created_by ? profileMap.get(created_by) ?? null : null,
+      apartment_code: r.apartment_id ? aptMap.get(r.apartment_id) ?? null : null,
+    }
+  })
+}
+
+export async function fetchCleaningReport(from: string, to: string): Promise<ReportMoveRow[]> {
+  const [cleaning, reversals] = await Promise.all([
+    fetchAllMovesPaginated({ source_type: 'cleaning', moved_at_gte: from, moved_at_lt: to }),
+    fetchAllMovesPaginated({ source_type: 'cleaning_reversal', moved_at_gte: from, moved_at_lt: to }),
+  ])
+  const reversalIds = new Set(reversals.map((r) => r.id))
+  const cleaningFiltered = cleaning.filter((r) => !reversalIds.has(r.id))
+  return [...cleaningFiltered, ...reversals]
+}
+
+export async function fetchMovesReport(params: {
+  from: string
+  to: string
+  itemId?: number | null
+  apartmentId?: number | null
+  sourceType?: string | null
+}): Promise<ReportMoveRow[]> {
+  const filters: Record<string, unknown> = {
+    moved_at_gte: params.from,
+    moved_at_lt: params.to,
+  }
+  if (params.itemId) filters.item_id = params.itemId
+  if (params.apartmentId) filters.apartment_id = params.apartmentId
+  if (params.sourceType) filters.source_type = params.sourceType
+  return fetchAllMovesPaginated(filters)
+}
